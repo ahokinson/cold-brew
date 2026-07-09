@@ -1,0 +1,114 @@
+version: '3'
+
+vars:
+  BIN: cold-brew
+  ENTRY: dev.ts
+
+tasks:
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list
+    silent: true
+
+  deps:
+    desc: Install dependencies
+    sources:
+      - package.json
+    generates:
+      - node_modules/.package-lock.json
+    cmds:
+      - bun install
+
+  install:
+    desc: Build and symlink to /usr/local/bin
+    deps: [build]
+    cmds:
+      - sudo ln -sf {{.ROOT_DIR}}/dist/{{.BIN}} /usr/local/bin/{{.BIN}}
+
+
+  dev:
+    desc: Run TUI in development mode with watch
+    deps: [deps]
+    cmds:
+      - bun run --watch {{.ENTRY}}
+
+  run:
+    desc: Run cold-brew (pass args with -- e.g. task run -- upgrade)
+    deps: [deps]
+    cmds:
+      - bun run {{.ENTRY}} {{.CLI_ARGS}}
+
+  build:
+    desc: Bundle with Solid JSX transform then compile to standalone binary
+    deps: [deps]
+    sources:
+      - src/**/*.ts
+      - src/**/*.tsx
+      - tap/**/*.rb
+      - build.ts
+      - tsconfig.json
+      - bunfig.toml
+      - package.json
+    generates:
+      - dist/{{.BIN}}
+    cmds:
+      - bun run build.ts
+      - bun build dist/index.js --compile --outfile dist/{{.BIN}}
+
+  tap:
+    desc: Sync custom tap formulas to Homebrew
+    deps: [deps]
+    cmds:
+      - bun run {{.ENTRY}} tap sync
+
+  check:
+    desc: Type-check the project
+    deps: [deps]
+    cmds:
+      - bunx tsc --noEmit
+
+  lint:
+    desc: Lint and format check with Biome
+    deps: [deps]
+    cmds:
+      # Scoped package name so this can't resolve the unrelated `biome` npm
+      # package instead of the linter (@biomejs/biome, pinned in package.json).
+      - bunx @biomejs/biome check src
+
+  format:
+    desc: Auto-fix lint and formatting issues with Biome
+    deps: [deps]
+    cmds:
+      - bunx @biomejs/biome check --write src
+
+  test:
+    desc: Run tests and enforce 95% line/function coverage
+    deps: [deps]
+    cmds:
+      - bun test
+      - bun scripts/check-coverage.ts
+
+  test:watch:
+    desc: Run tests in watch mode (no coverage enforcement)
+    deps: [deps]
+    cmds:
+      - bun test --watch
+
+  test:cov:
+    desc: Run tests with coverage (text + lcov), no threshold check
+    deps: [deps]
+    cmds:
+      - bun test --coverage
+
+  clean:
+    desc: Remove node_modules and build artifacts
+    cmds:
+      - rm -rf node_modules
+      - rm -rf dist
+
+  db:reset:
+    desc: Delete the SQLite database (recreated on next run)
+    cmds:
+      - rm -f ~/.config/cold-brew/cold-brew.db ~/.config/cold-brew/cold-brew.db-wal ~/.config/cold-brew/cold-brew.db-shm
+      - echo "Database reset."

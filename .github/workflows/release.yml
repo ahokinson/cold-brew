@@ -1,0 +1,139 @@
+name: Release
+
+# Tagging a commit with a release number (e.g. `v0.2.0`) builds the standalone
+# binary, publishes a GitHub Release with it attached, and points the Homebrew
+# formula in ahokinson/homebrew-tap at it so users can:
+#   brew install ahokinson/tap/cold-brew
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # create the release and upload assets
+  packages: read # install the private @ahokinson/press from GitHub Packages
+
+jobs:
+  release:
+    # Apple Silicon only. @opentui/core ships platform-gated native FFI, so the
+    # binary must be compiled on its own native arch — no cross-compilation.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          # Matches local dev; there is no version file in the repo to read.
+          bun-version: 1.3.14
+
+      - name: Authenticate to GitHub Packages
+        # The repo .npmrc already points @ahokinson at npm.pkg.github.com; add
+        # the token so `bun install` can pull the private dependency.
+        # NOTE: the default GITHUB_TOKEN can read packages in this owner's scope.
+        # If @ahokinson/press is not readable with it, create a repo secret
+        # (a PAT with `read:packages`) and swap it in here.
+        run: echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" >> .npmrc
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bunx tsc --noEmit
+
+      - name: Lint
+        run: bunx @biomejs/biome check src
+
+      - name: Test with coverage gate
+        run: |
+          bun test
+          bun scripts/check-coverage.ts
+
+      - name: Resolve version
+        # TAG keeps the leading v (git tag / release / asset name); VERSION is the
+        # bare semver the binary and Homebrew formula report.
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          echo "TAG=${TAG}" >> "$GITHUB_ENV"
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+          echo "ASSET=cold-brew-${TAG}-darwin-arm64.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Build standalone binary
+        # Mirrors Taskfile.yml `build`; COLD_BREW_VERSION is baked into the binary.
+        env:
+          COLD_BREW_VERSION: ${{ env.VERSION }}
+        run: |
+          bun run build.ts
+          bun build dist/index.js --compile --outfile dist/cold-brew
+
+      - name: Smoke test the binary is self-contained
+        # Run from an empty dir so a missing sidecar (opentui emits .wasm/.scm
+        # next to the bundle) would surface here rather than in a user's hands.
+        run: |
+          workdir="$(mktemp -d)"
+          cp dist/cold-brew "$workdir/cold-brew"
+          reported="$("$workdir/cold-brew" --version)"
+          echo "binary reports: $reported"
+          test "$reported" = "${VERSION}"
+
+      - name: Package release artifact
+        run: |
+          tar -czf "$ASSET" -C dist cold-brew
+          shasum -a 256 "$ASSET" > "$ASSET.sha256"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256
+
+      - name: Update Homebrew tap
+        # Points ahokinson/homebrew-tap at the freshly-published asset. Needs a
+        # token that can push to that *other* repo — the default GITHUB_TOKEN
+        # can't. Create a repo secret HOMEBREW_TAP_TOKEN: a fine-grained PAT with
+        # Contents: read+write on ahokinson/homebrew-tap (or a classic PAT with
+        # `repo`). The tap's default branch is `develop`.
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          sha="$(shasum -a 256 "$ASSET" | awk '{print $1}')"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${ASSET}"
+
+          git clone --depth 1 --branch develop \
+            "https://x-access-token:${TAP_TOKEN}@github.com/ahokinson/homebrew-tap.git" tap
+
+          cat > tap/Formula/cold-brew.rb <<EOF
+          class ColdBrew < Formula
+            desc "Security-focused Homebrew wrapper that holds back package upgrades"
+            homepage "https://github.com/ahokinson/cold-brew"
+            version "${VERSION}"
+            url "${url}"
+            sha256 "${sha}"
+
+            # Prebuilt binary: cold-brew bundles a private dependency and compiles
+            # with Bun in CI, so it ships as a compiled artifact rather than a
+            # from-source build. Apple Silicon only for now.
+            depends_on :macos
+            depends_on arch: :arm64
+
+            def install
+              bin.install "cold-brew"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/cold-brew --version")
+            end
+          end
+          EOF
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/cold-brew.rb
+          if git diff --cached --quiet; then
+            echo "Formula unchanged; nothing to push"
+          else
+            git commit -m "cold-brew ${VERSION}"
+            git push origin develop
+          fi
